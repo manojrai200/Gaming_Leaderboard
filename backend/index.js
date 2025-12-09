@@ -150,10 +150,10 @@ const start = async () => {
     await startConsumer();
 
     // Start Express server
-    app.listen(PORT, "0.0.0.0", () => {
+    app.listen(PORT, () => {
       logger.info(`🚀 Server running on port ${PORT}`);
-      logger.info(`📊 API available at http://0.0.0.0:${PORT}`);
-      logger.info(`🏥 Health check: http://0.0.0.0:${PORT}/health`);
+      // logger.info(`📊 API available at http://0.0.0.0:${PORT}`);
+      // logger.info(`🏥 Health check: http://0.0.0.0:${PORT}/health`);
     });
   } catch (err) {
     logger.error("Failed to start server", err);
