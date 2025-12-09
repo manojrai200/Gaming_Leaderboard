@@ -1,0 +1,308 @@
+config:
+  target: "http://localhost:3001"
+  phases:
+    # Initial health check - verify server is responding
+    - duration: 30
+      arrivalRate: 1
+      name: "Initial Health Check"
+    # Warm-up phase: Gradually ramp up to 25 users
+    - duration: 90
+      arrivalRate: 1
+      rampTo: 25
+      name: "Warm-up to 25 users"
+    # Ramp-up phase: Increase to 150 users over 3 minutes (gradual)
+    - duration: 180
+      arrivalRate: 25
+      rampTo: 150
+      name: "Ramp-up to 150 users"
+    # Sustained load: Maintain 150 concurrent users for 3 minutes
+    - duration: 180
+      arrivalRate: 150
+      name: "Sustained 150 concurrent users"
+    # Cool-down phase: Gradually reduce load
+    - duration: 90
+      arrivalRate: 150
+      rampTo: 0
+      name: "Cool-down Phase"
+  
+  # Default HTTP settings
+  http:
+    timeout: 30  # 30 second timeout
+    pool: 100     # Connection pool sized for 150 users
+    keepAlive: true
+    keepAliveMsecs: 1000
+    maxSockets: 30  # Limit concurrent connections per origin
+  
+  # Processor for generating dynamic data
+  processor: "./artillery-processor.js"
+  
+  # Plugins
+  plugins:
+    expect: {}
+    metrics-by-endpoint:
+      stripQueryString: true
+
+# Scenarios define different user behaviors
+scenarios:
+  # Scenario 0: Health Check - Verify server is responding
+  - name: "Health Check"
+    weight: 5
+    flow:
+      - get:
+          url: "/health"
+          expect:
+            - statusCode: [200, 503]  # 503 is ok if services are degraded
+            - contentType: json
+      - think: 1
+      - get:
+          url: "/live"
+          expect:
+            - statusCode: 200
+
+  # Scenario 1: Active Player - Submits scores and checks leaderboard
+  - name: "Active Player"
+    weight: 35
+    flow:
+      # Get available game modes first
+      - get:
+          url: "/api/game-modes"
+          capture:
+            - json: "$.gameModes[0].id"
+              as: "gameMode1"
+            - json: "$.gameModes[1].id"
+              as: "gameMode2"
+          expect:
+            - statusCode: [200, 429]
+      
+      # Wait before submitting
+      - think: 2
+      
+      # Submit a score
+      - post:
+          url: "/api/scores/submit"
+          json:
+            playerId: "{{ $uuid() }}"
+            username: "player{{ $randomString(8) }}"
+            gameMode: "{{ gameMode1 }}"
+            score: "{{ $randomInt(1000, 100000) }}"
+            gameDurationSeconds: "{{ $randomInt(60, 3600) }}"
+          expect:
+            - statusCode: [202, 429]  # Accept rate limit responses
+      
+      # Wait before next request (simulate user behavior)
+      - think: 2
+      
+      # Check leaderboard for the game mode
+      - get:
+          url: "/api/leaderboard/{{ gameMode1 }}"
+          qs:
+            type: "global"
+            limit: 100
+          expect:
+            - statusCode: [200, 429]  # Accept rate limit responses
+            - contentType: json
+            - hasProperty: leaderboard
+      
+      # Wait before next request
+      - think: 1
+      
+      # Check top 100 leaderboard
+      - get:
+          url: "/api/leaderboard/{{ gameMode1 }}/top100"
+          qs:
+            type: "global"
+          expect:
+            - statusCode: [200, 429]  # Accept rate limit responses
+
+  # Scenario 2: Leaderboard Viewer - Only reads leaderboards
+  - name: "Leaderboard Viewer"
+    weight: 35
+    flow:
+      - get:
+          url: "/api/game-modes"
+          capture:
+            - json: "$.gameModes[0].id"
+              as: "gameMode"
+          expect:
+            - statusCode: [200, 429]
+      
+      - think: 3
+      
+      - get:
+          url: "/api/leaderboard/{{ gameMode }}"
+          qs:
+            type: "global"
+            limit: 50
+          expect:
+            - statusCode: [200, 429]
+      
+      - think: 2
+      
+      - get:
+          url: "/api/leaderboard/{{ gameMode }}/top100"
+          qs:
+            type: "daily"
+          expect:
+            - statusCode: [200, 429]
+      
+      - think: 2
+      
+      - get:
+          url: "/api/leaderboard/{{ gameMode }}"
+          qs:
+            type: "weekly"
+            limit: 100
+            offset: 0
+          expect:
+            - statusCode: [200, 429]
+
+  # Scenario 3: Competitive Player - Submits multiple scores and checks rank
+  - name: "Competitive Player"
+    weight: 15
+    flow:
+      - get:
+          url: "/api/game-modes"
+          capture:
+            - json: "$.gameModes[0].id"
+              as: "gameMode"
+          expect:
+            - statusCode: [200, 429]
+      
+      # Generate a player ID for this session
+      - function: "generatePlayerId"
+      
+      # Wait before submitting
+      - think: 2
+      
+      # Submit multiple scores
+      - post:
+          url: "/api/scores/submit"
+          json:
+            playerId: "{{ playerId }}"
+            username: "{{ username }}"
+            gameMode: "{{ gameMode }}"
+            score: "{{ $randomInt(5000, 50000) }}"
+            gameDurationSeconds: "{{ $randomInt(120, 1800) }}"
+          capture:
+            - json: "$.playerId"
+              as: "submittedPlayerId"
+          expect:
+            - statusCode: [202, 429]  # Accept rate limit responses
+      
+      # Wait a bit before checking rank (simulating real user behavior)
+      - think: 5
+      
+      # Check player's rank
+      - get:
+          url: "/api/players/{{ playerId }}/rank/{{ gameMode }}"
+          qs:
+            type: "global"
+          expect:
+            - statusCode: [200, 404, 429]  # 404 if player not in leaderboard yet, 429 for rate limit
+      
+      # Wait before next submission (respect rate limits)
+      - think: 8
+      
+      # Submit another score
+      - post:
+          url: "/api/scores/submit"
+          json:
+            playerId: "{{ playerId }}"
+            username: "{{ username }}"
+            gameMode: "{{ gameMode }}"
+            score: "{{ $randomInt(10000, 100000) }}"
+            gameDurationSeconds: "{{ $randomInt(180, 2400) }}"
+          expect:
+            - statusCode: [202, 429]
+      
+      # Wait before checking stats
+      - think: 3
+      
+      # Check player stats
+      - get:
+          url: "/api/players/{{ playerId }}/stats"
+          expect:
+            - statusCode: [200, 404, 429]
+
+  # Scenario 4: Casual Browser - Just browsing
+  - name: "Casual Browser"
+    weight: 5
+    flow:
+      - get:
+          url: "/api/game-modes"
+          expect:
+            - statusCode: [200, 429]
+            - contentType: json
+      
+      - think: 4
+      
+      - get:
+          url: "/api/leaderboard/1"
+          qs:
+            type: "global"
+            limit: 10
+          expect:
+            - statusCode: [200, 429]
+      
+      - think: 3
+      
+      - get:
+          url: "/api/leaderboard/1/top100"
+          expect:
+            - statusCode: [200, 429]
+
+  # Scenario 5: High-frequency Score Submitter - Stress test write operations
+  - name: "High-frequency Submitter"
+    weight: 5
+    flow:
+      - get:
+          url: "/api/game-modes"
+          capture:
+            - json: "$.gameModes[0].id"
+              as: "gameMode"
+          expect:
+            - statusCode: [200, 429]
+      
+      - function: "generatePlayerId"
+      
+      # Wait before first submission
+      - think: 2
+      
+      # Submit multiple scores (with delays to avoid rate limiting)
+      - post:
+          url: "/api/scores/submit"
+          json:
+            playerId: "{{ playerId }}"
+            username: "{{ username }}"
+            gameMode: "{{ gameMode }}"
+            score: "{{ $randomInt(1000, 99999) }}"
+            gameDurationSeconds: "{{ $randomInt(60, 3000) }}"
+          expect:
+            - statusCode: [202, 429]  # Accept rate limit responses
+      
+      - think: 8  # Wait 8 seconds to avoid rate limit (10 per minute)
+      
+      - post:
+          url: "/api/scores/submit"
+          json:
+            playerId: "{{ playerId }}"
+            username: "{{ username }}"
+            gameMode: "{{ gameMode }}"
+            score: "{{ $randomInt(1000, 99999) }}"
+            gameDurationSeconds: "{{ $randomInt(60, 3000) }}"
+          expect:
+            - statusCode: [202, 429]
+      
+      - think: 8
+      
+      - post:
+          url: "/api/scores/submit"
+          json:
+            playerId: "{{ playerId }}"
+            username: "{{ username }}"
+            gameMode: "{{ gameMode }}"
+            score: "{{ $randomInt(1000, 99999) }}"
+            gameDurationSeconds: "{{ $randomInt(60, 3000) }}"
+          expect:
+            - statusCode: [202, 429]
+
